@@ -1,5 +1,5 @@
 // Service worker : mode hors ligne (stale-while-revalidate sur les fichiers de l'appli)
-const CACHE = 'pellets-v1';
+const CACHE = 'pellets-v2';
 const ASSETS = [
   './',
   './index.html',

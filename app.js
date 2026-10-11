@@ -31,6 +31,10 @@ let locked = false;
 let ignorePop = false;
 let deferredInstall = null;
 let toastTimer = null;
+let weatherBusy = false;
+let weather = (() => {
+  try { return JSON.parse(localStorage.getItem('pellets.weather')) || null; } catch (e) { return null; }
+})();
 
 /* ---------------------------- Persistance ---------------------------- */
 function load() {
@@ -190,6 +194,26 @@ async function fetchTempExt() {
   }
 }
 
+// Température extérieure « en direct » affichée sur l'accueil (cache 15 min)
+function refreshWeather(force) {
+  if (!S || weatherBusy) return;
+  if (!force && weather && Date.now() - weather.ts < 15 * 60000) return;
+  weatherBusy = true;
+  fetchTempExt().then((t) => {
+    weatherBusy = false;
+    if (t == null) { if (force) toast('Météo indisponible (pas de connexion ?)'); return; }
+    weather = { t, ts: Date.now() };
+    try { localStorage.setItem('pellets.weather', JSON.stringify(weather)); } catch (e) { /* ignore */ }
+    if (tab === 'home' && !$('.sheet-wrap')) render();
+  });
+}
+
+// Dernière température intérieure saisie (valable 12 h pour pré-remplir un nouveau sac)
+function recentTempInt() {
+  const l = S.settings.lastTempInt;
+  return l && Date.now() - l.ts < 12 * HOUR ? l.t : null;
+}
+
 function attachExtTemp(id) {
   fetchTempExt().then((t) => {
     if (t == null || !S) return;
@@ -209,7 +233,8 @@ function addOpen() {
   const ev = {
     id: uid(), type: 'open', ts: Date.now(),
     brand: lastBrand(), price: currentBagPrice(),
-    tempExt: null, tempInt: null, note: ''
+    tempExt: weather && Date.now() - weather.ts < 30 * 60000 ? weather.t : null,
+    tempInt: recentTempInt(), note: ''
   };
   S.events.push(ev);
   save();
@@ -222,7 +247,7 @@ function addOpen() {
     { label: 'Annuler', fn: () => { removeEvent(ev.id); toast('Appui annulé'); } },
     { label: 'Détails', fn: () => editSheet(ev.id) }
   ], 7000);
-  attachExtTemp(ev.id);
+  if (ev.tempExt == null) attachExtTemp(ev.id);
 }
 
 function removeEvent(id) {
@@ -305,7 +330,8 @@ function renderHome() {
           <div class="big" data-since="${cur.start}">${fmtDur(st.now - cur.start)}</div>
         </div>
         <div class="right small muted">ouvert<br>${esc(fmtDT(cur.start))}</div>
-      </div>${progress}`;
+      </div>${progress}
+      ${cur.ev.tempExt != null || cur.ev.tempInt != null ? `<div class="small muted" style="margin-top:6px">À l'ouverture : ${[cur.ev.tempExt != null ? 'dehors ' + fmtTemp(cur.ev.tempExt) : '', cur.ev.tempInt != null ? 'dedans ' + fmtTemp(cur.ev.tempInt) : ''].filter(Boolean).join(' · ')}</div>` : ''}`;
   } else {
     curHtml = `<div class="muted">Aucun sac ouvert pour l'instant.</div>`;
   }
@@ -317,6 +343,18 @@ function renderHome() {
       <div class="stock-unit">${Math.abs(stock) > 1 ? 'sacs' : 'sac'} non ouvert${Math.abs(stock) > 1 ? 's' : ''}</div>
       ${st.endDate ? `<span class="chip">Fin estimée : ${esc(fmtDate(st.endDate))} · ≈ ${days} j</span>` : ''}
     </section>
+    <div class="grid2 temps">
+      <button class="card tcard" data-act="weather" aria-label="Actualiser la température extérieure">
+        <div class="kpi-label">Dehors</div>
+        <div class="kpi">${weather ? `${fmtNum(weather.t, 1)} <small>°C</small>` : '…'}</div>
+        <div class="kpi-sub">${weather ? `relevé à ${esc(fmtTime(weather.ts))}` : 'touche pour actualiser'}</div>
+      </button>
+      <button class="card tcard" data-act="tempint" aria-label="Saisir la température intérieure">
+        <div class="kpi-label">Dedans</div>
+        <div class="kpi">${S.settings.lastTempInt ? `${fmtNum(S.settings.lastTempInt.t, 1)} <small>°C</small>` : '—'}</div>
+        <div class="kpi-sub">${S.settings.lastTempInt ? `saisi à ${esc(fmtTime(S.settings.lastTempInt.ts))}` : 'touche pour saisir'}</div>
+      </button>
+    </div>
     <section class="card current">${curHtml}</section>
     <button class="bigbtn" data-act="open" ${locked ? 'disabled' : ''} aria-label="Ouvrir un nouveau sac">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
@@ -683,6 +721,18 @@ function deliverySheet() {
     </form>`);
 }
 
+function tempIntSheet() {
+  const l = S.settings.lastTempInt;
+  openSheet('Température intérieure', `
+    <form data-form="tempint">
+      <label>Température dans la maison (°C)
+        <input type="number" name="t" step="any" inputmode="decimal" value="${l ? l.t : ''}" required>
+      </label>
+      <p class="hint">Relève-la sur ton Ecojoko. Elle est enregistrée sur le sac en cours et pré-remplie pour les prochains sacs pendant 12 h.</p>
+      <button class="primary">Enregistrer</button>
+    </form>`);
+}
+
 function adjustSheet() {
   openSheet('Ajuster le stock', `
     <form data-form="adjust">
@@ -713,6 +763,7 @@ const forms = {
     save();
     applyTheme();
     render();
+    refreshWeather(true);
     if (Math.abs(Date.now() - ts) < 6 * HOUR) attachExtTemp(ev.id);
     toast('C\'est parti ! Appuie sur « Nouveau sac » à chaque sac ouvert.');
   },
@@ -768,6 +819,18 @@ const forms = {
     closeSheet();
     render();
     toast(`+${bagsN} sacs · stock : ${stockNow()}`);
+  },
+
+  tempint(f) {
+    const t = num(new FormData(f).get('t'));
+    if (t == null) return;
+    S.settings.lastTempInt = { t: round(t, 1), ts: Date.now() };
+    const cur = bags().pop();
+    if (cur && cur.ev.tempInt == null) cur.ev.tempInt = round(t, 1);
+    save();
+    closeSheet();
+    render();
+    toast(`Température intérieure : ${fmtNum(t, 1)} °C`);
   },
 
   adjust(f) {
@@ -875,7 +938,7 @@ document.addEventListener('click', (e) => {
     if (a) a.fn();
     return;
   }
-  if (el.dataset.tab) { tab = el.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  if (el.dataset.tab) { tab = el.dataset.tab; render(); window.scrollTo(0, 0); if (tab === 'home') refreshWeather(); return; }
   if (el.dataset.period) { period = el.dataset.period; render(); return; }
   if (el.dataset.edit) { editSheet(el.dataset.edit); return; }
 
@@ -884,6 +947,8 @@ document.addEventListener('click', (e) => {
     case 'undo': undoLast(); break;
     case 'delivery': deliverySheet(); break;
     case 'adjust': adjustSheet(); break;
+    case 'weather': toast('Actualisation de la météo…'); refreshWeather(true); break;
+    case 'tempint': tempIntSheet(); break;
     case 'close-sheet': closeSheet(); break;
     case 'delete': {
       const id = el.dataset.id;
@@ -935,7 +1000,7 @@ function tick() {
 setInterval(tick, 30000);
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && S && !$('.sheet-wrap')) render();
+  if (!document.hidden && S && !$('.sheet-wrap')) { render(); refreshWeather(); }
 });
 
 window.addEventListener('beforeinstallprompt', (e) => {
@@ -951,3 +1016,4 @@ if (navigator.storage && navigator.storage.persist) navigator.storage.persist().
 
 applyTheme();
 render();
+refreshWeather();
