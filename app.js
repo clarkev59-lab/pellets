@@ -97,6 +97,75 @@ function fromInput(v) {
 const ymd = (ts) => toLocalInput(ts).slice(0, 10);
 
 /* ------------------------------ Calculs ------------------------------ */
+/* --------------------------- Planning du poêle --------------------------- */
+// days : 0 = dimanche … 6 = samedi
+const DEFAULT_SCHEDULE = [
+  { days: [1, 2, 3, 4, 5], from: '05:30', to: '10:00', temp: 18 },
+  { days: [1, 2, 3, 4, 5], from: '16:30', to: '21:00', temp: 19 },
+  { days: [0, 6], from: '08:30', to: '13:00', temp: 19 }
+];
+const schedule = () => (S.settings.schedule && S.settings.schedule.length ? S.settings.schedule : DEFAULT_SCHEDULE);
+const bagKg = () => (S.settings.bagKg > 0 ? S.settings.bagKg : 15);
+const toMin = (s) => { const [h, m] = String(s).split(':').map(Number); return h * 60 + (m || 0); };
+const atMin = (d, min) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, min).getTime();
+const fmtH = (ms) => (ms == null ? '—' : `${fmtNum(ms / HOUR, 1)} h`);
+
+// Durée (ms) pendant laquelle le poêle est programmé entre a et b
+function stoveMs(a, b) {
+  if (!(b > a)) return 0;
+  const sched = schedule();
+  let total = 0;
+  const d = new Date(a);
+  d.setHours(0, 0, 0, 0);
+  while (d.getTime() < b) {
+    const dow = d.getDay();
+    for (const p of sched) {
+      if (!p.days.includes(dow)) continue;
+      const lo = Math.max(a, atMin(d, toMin(p.from)));
+      const hi = Math.min(b, atMin(d, toMin(p.to)));
+      if (hi > lo) total += hi - lo;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  return total;
+}
+
+function weeklyStoveMs() {
+  return schedule().reduce((t, p) => t + p.days.length * (toMin(p.to) - toMin(p.from)) * 60000, 0);
+}
+
+// Instant où `need` ms de chauffe supplémentaires seront écoulées à partir de `from`
+function timeAfterStoveMs(from, need) {
+  const sched = schedule();
+  const d = new Date(from);
+  d.setHours(0, 0, 0, 0);
+  let acc = 0;
+  for (let i = 0; i < 1500; i++) {
+    const dow = d.getDay();
+    const ivs = sched.filter((p) => p.days.includes(dow))
+      .map((p) => [atMin(d, toMin(p.from)), atMin(d, toMin(p.to))])
+      .sort((x, y) => x[0] - y[0]);
+    for (const [s, e] of ivs) {
+      const lo = Math.max(from, s);
+      if (e > lo) {
+        const len = e - lo;
+        if (acc + len >= need) return lo + (need - acc);
+        acc += len;
+      }
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  return null;
+}
+
+function daysLabel(days) {
+  const k = [...days].sort().join(',');
+  if (k === '1,2,3,4,5') return 'Lun – ven';
+  if (k === '0,6') return 'Sam – dim';
+  const n = ['dim', 'lun', 'mar', 'mer', 'jeu', 'ven', 'sam'];
+  return days.map((x) => n[x]).join(', ');
+}
+
 function opens() {
   return S.events.filter((e) => e.type === 'open').sort((a, b) => a.ts - b.ts);
 }
@@ -148,9 +217,23 @@ function computeStats() {
   const stock = stockNow();
   const cur = bl[bl.length - 1] || null;
 
+  // Heures de chauffe (selon le planning du poêle) consommées par chaque sac terminé
+  const hDurs = done.map((b) => stoveMs(b.start, b.end)).filter((h) => h > 30 * 60000);
+  const avgH = mean(hDurs);
+  const recentH = hDurs.slice(-10);
+  const avgHRecent = recentH.length >= 3 ? mean(recentH) : avgH;
+  const weeklyH = weeklyStoveMs();
+  const curH = cur ? stoveMs(cur.start, now) : 0;
+
   let remaining = null;
   let endDate = null;
-  if (avgRecent && cur) {
+  let byPlanning = false;
+  if (avgHRecent && cur && weeklyH > 0) {
+    const need = Math.max(0, stock) * avgHRecent + Math.max(0, avgHRecent - curH);
+    const t = timeAfterStoveMs(now, need);
+    if (t != null) { endDate = t; remaining = t - now; byPlanning = true; }
+  }
+  if (!byPlanning && avgRecent && cur) {
     const curLeft = Math.max(0, avgRecent - (now - cur.start));
     remaining = Math.max(0, stock) * avgRecent + curLeft;
     endDate = now + remaining;
@@ -165,6 +248,8 @@ function computeStats() {
 
   return {
     now, bl, done, durs, avg, avgRecent, stock, cur, remaining, endDate,
+    avgH, curH, weeklyH, byPlanning,
+    kgPerH: avgH ? bagKg() / (avgH / HOUR) : null,
     min: durs.length ? Math.min(...durs) : null,
     max: durs.length ? Math.max(...durs) : null,
     w7: bl.filter((b) => b.start > now - 7 * DAY).length,
@@ -314,12 +399,14 @@ function renderHome() {
   if (cur) {
     let progress = '';
     if (st.avg) {
-      const el = st.now - cur.start;
-      const pct = Math.min(100, (el / st.avg) * 100);
-      const over = el > st.avg;
+      const el = st.avgH ? st.curH : st.now - cur.start;
+      const ref = st.avgH || st.avg;
+      const refLabel = st.avgH ? `${fmtH(st.avgH)} de chauffe` : fmtDur(st.avg);
+      const pct = Math.min(100, (el / ref) * 100);
+      const over = el > ref;
       progress = `
         <div class="progress ${over ? 'over' : ''}"><i style="width:${pct.toFixed(1)}%"></i></div>
-        <div class="small muted">${over ? `Plus long que la moyenne (${fmtDur(st.avg)})` : `${Math.round(pct)} % de la durée moyenne (${fmtDur(st.avg)})`}</div>`;
+        <div class="small muted">${over ? `Plus long que la moyenne (${refLabel})` : `${Math.round(pct)} % d'un sac moyen (${refLabel})`}</div>`;
     } else {
       progress = `<div class="small muted">La durée moyenne apparaîtra dès le 2ᵉ sac.</div>`;
     }
@@ -329,7 +416,7 @@ function renderHome() {
           <div class="kpi-label">Sac n°${cur.n} en cours</div>
           <div class="big" data-since="${cur.start}">${fmtDur(st.now - cur.start)}</div>
         </div>
-        <div class="right small muted">ouvert<br>${esc(fmtDT(cur.start))}</div>
+        <div class="right small muted">ouvert<br>${esc(fmtDT(cur.start))}<br>${fmtH(st.curH)} de chauffe</div>
       </div>${progress}
       ${cur.ev.tempExt != null || cur.ev.tempInt != null ? `<div class="small muted" style="margin-top:6px">À l'ouverture : ${[cur.ev.tempExt != null ? 'dehors ' + fmtTemp(cur.ev.tempExt) : '', cur.ev.tempInt != null ? 'dedans ' + fmtTemp(cur.ev.tempInt) : ''].filter(Boolean).join(' · ')}</div>` : ''}`;
   } else {
@@ -380,13 +467,13 @@ function renderHistory() {
       let cmp = '';
       if (b.end != null) {
         const d = b.end - b.start;
-        sub = `Durée ${fmtDur(d)}`;
+        sub = `Durée ${fmtDur(d)} · ${fmtH(stoveMs(b.start, b.end))} de chauffe`;
         if (st.avg && st.done.length > 1) {
           const p = Math.round(((d - st.avg) / st.avg) * 100);
           if (Math.abs(p) >= 1) cmp = ` · <span class="${p > 0 ? 'tag-up' : 'tag-down'}">${p > 0 ? '▲ +' : '▼ '}${p} %</span>`;
         }
       } else {
-        sub = `En cours · ${fmtDur(st.now - b.start)}`;
+        sub = `En cours · ${fmtDur(st.now - b.start)} · ${fmtH(stoveMs(b.start, st.now))} de chauffe`;
       }
       const price = bagPrice(e);
       const temps = [e.tempExt != null ? `ext ${fmtTemp(e.tempExt)}` : '', e.tempInt != null ? `int ${fmtTemp(e.tempInt)}` : ''].filter(Boolean).join(' · ');
@@ -562,11 +649,13 @@ function renderStats() {
       ${card('Total consommé', `${st.bl.length} <small>sacs</small>`, `depuis le ${esc(fmtShort(st.since))}`)}
       ${card('Rythme', st.perWeek != null ? `${fmtNum(st.perWeek, 1)} <small>/ sem.</small>` : '—', st.perMonth != null ? `≈ ${fmtNum(st.perMonth, 1)} sacs / mois` : '')}
       ${card('7 / 30 derniers jours', `${st.w7} <small>/</small> ${st.w30}`, 'sacs ouverts')}
+      ${card('Chauffe par sac', st.avgH ? esc(fmtH(st.avgH)) : '—', st.avgH ? 'heures de poêle en moyenne' : 'dès le 2ᵉ sac')}
+      ${card('Consommation', st.kgPerH ? `${fmtNum(st.kgPerH, 2)} <small>kg/h</small>` : '—', st.kgPerH ? `≈ ${fmtNum((st.kgPerH * st.weeklyH) / HOUR, 0)} kg / semaine` : `sacs de ${fmtNum(bagKg(), 0)} kg`)}
     </div>
     <div class="card" style="margin-top:12px">
       <div class="kpi-label">Fin du stock estimée</div>
       <div class="kpi">${st.endDate ? esc(fmtDate(st.endDate, true)) : '—'}</div>
-      <div class="kpi-sub">${st.endDate ? `dans ≈ ${Math.round(st.remaining / DAY)} jours, avec ${Math.max(0, st.stock)} sacs en réserve + le sac en cours` : 'Disponible dès que 2 sacs ont été utilisés.'}</div>
+      <div class="kpi-sub">${st.endDate ? `dans ≈ ${Math.round(st.remaining / DAY)} jours, avec ${Math.max(0, st.stock)} sacs en réserve + le sac en cours${st.byPlanning ? ', selon ton planning de chauffe' : ''}` : 'Disponible dès que 2 sacs ont été utilisés.'}</div>
     </div>
     ${costHtml}
     <h3>Durée de chaque sac (${uLabel})</h3>
@@ -599,6 +688,9 @@ function renderSettings() {
       <label>Marque / lot par défaut
         <input name="brand" value="${esc(s.brand || '')}" autocomplete="off">
       </label>
+      <label>Poids d'un sac (kg)
+        <input type="number" name="bagKg" step="any" min="1" inputmode="decimal" value="${bagKg()}">
+      </label>
       <label>Thème
         <select name="theme">
           <option value="auto" ${theme === 'auto' ? 'selected' : ''}>Automatique (suit le téléphone)</option>
@@ -617,6 +709,12 @@ function renderSettings() {
       <p class="hint">La température extérieure est récupérée automatiquement (Open-Meteo) à chaque nouveau sac. La température intérieure se saisit à la main dans le détail d'un sac.</p>
       <button class="primary">Enregistrer</button>
     </form>
+
+    <h3>Planning du poêle</h3>
+    <div class="card">
+      ${schedule().map((p) => `<div class="item-plan"><b>${esc(daysLabel(p.days))}</b> · ${esc(p.from)} – ${esc(p.to)} · ${esc(p.temp)} °C</div>`).join('')}
+      <p class="hint" style="margin:10px 0 0">≈ ${fmtNum(weeklyStoveMs() / HOUR, 0)} h de chauffe par semaine. Sert à compter les heures de chauffe de chaque sac et à estimer la fin du stock. Les consignes sont indicatives.</p>
+    </div>
 
     <h3>Sauvegarde</h3>
     <div class="stack">
@@ -754,7 +852,8 @@ const forms = {
         initialStock: Math.max(0, Math.round(num(d.get('stock')) ?? 0)),
         palettePrice: num(d.get('palettePrice')),
         bagsPerPalette: num(d.get('bpp')),
-        brand, lat: 50.39, lon: 2.86, theme: 'auto'
+        brand, lat: 50.39, lon: 2.86, theme: 'auto',
+        bagKg: 15, schedule: DEFAULT_SCHEDULE
       },
       events: []
     };
@@ -775,6 +874,7 @@ const forms = {
     s.bagsPerPalette = num(d.get('bpp'));
     s.brand = String(d.get('brand') || '').trim();
     s.theme = d.get('theme') || 'auto';
+    s.bagKg = num(d.get('bagKg')) || 15;
     s.lat = num(d.get('lat')) ?? s.lat;
     s.lon = num(d.get('lon')) ?? s.lon;
     save();
@@ -874,15 +974,15 @@ const dec = (v) => (v == null ? '' : String(v).replace('.', ','));
 const ymdhm = (ts) => toLocalInput(ts).replace('T', ' ');
 
 function exportCSV() {
-  const head = ['type', 'numero_sac', 'debut', 'fin', 'duree_heures', 'prix_sac_eur', 'marque', 'temp_ext_c', 'temp_int_c', 'nb_sacs', 'montant_livraison_eur', 'note'];
+  const head = ['type', 'numero_sac', 'debut', 'fin', 'duree_heures', 'heures_chauffe', 'prix_sac_eur', 'marque', 'temp_ext_c', 'temp_int_c', 'nb_sacs', 'montant_livraison_eur', 'note'];
   const map = new Map(bags().map((b) => [b.ev.id, b]));
   const rows = [...S.events].sort((a, b) => a.ts - b.ts).map((e) => {
     if (e.type === 'open') {
       const b = map.get(e.id);
-      return ['sac', b.n, ymdhm(e.ts), b.end ? ymdhm(b.end) : '', b.end ? dec(round((b.end - b.start) / HOUR, 2)) : '', dec(bagPrice(e)), e.brand || '', dec(e.tempExt), dec(e.tempInt), '', '', e.note || ''];
+      return ['sac', b.n, ymdhm(e.ts), b.end ? ymdhm(b.end) : '', b.end ? dec(round((b.end - b.start) / HOUR, 2)) : '', dec(round(stoveMs(b.start, b.end || Date.now()) / HOUR, 2)), dec(bagPrice(e)), e.brand || '', dec(e.tempExt), dec(e.tempInt), '', '', e.note || ''];
     }
-    if (e.type === 'delivery') return ['livraison', '', ymdhm(e.ts), '', '', '', '', '', '', e.bags, dec(e.total), e.note || ''];
-    return ['ajustement', '', ymdhm(e.ts), '', '', '', '', '', '', e.delta, '', e.note || ''];
+    if (e.type === 'delivery') return ['livraison', '', ymdhm(e.ts), '', '', '', '', '', '', '', e.bags, dec(e.total), e.note || ''];
+    return ['ajustement', '', ymdhm(e.ts), '', '', '', '', '', '', '', e.delta, '', e.note || ''];
   });
   const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\r\n');
   download(`pellets-${ymd(Date.now())}.csv`, csv, 'text/csv;charset=utf-8');

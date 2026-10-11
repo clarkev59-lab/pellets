@@ -142,6 +142,8 @@ button.tcard {
 }
 button.tcard:active { background: var(--accent-soft); }
 .temps { margin-bottom: 12px; }
+.item-plan { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+.item-plan:last-of-type { border-bottom: 0; }
 
 .kpi-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
 .kpi { font-size: 26px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin: 4px 0 2px; }
