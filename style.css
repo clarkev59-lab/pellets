@@ -142,6 +142,10 @@ button.tcard {
 }
 button.tcard:active { background: var(--accent-soft); }
 .temps { margin-bottom: 12px; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+.tbl th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px 8px 0; }
+.tbl td { padding: 7px 6px 7px 0; border-top: 1px solid var(--line); }
+.tbl th:not(:first-child), .tbl td:not(:first-child) { text-align: right; padding-right: 0; }
 .item-plan { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
 .item-plan:last-of-type { border-bottom: 0; }
 

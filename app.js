@@ -209,6 +209,11 @@ const lastBrand = () => {
 function computeStats() {
   const now = Date.now();
   const bl = bags();
+  bl.forEach((b) => {
+    const w = wxStats(b.start, b.end || now);
+    b.t = w ? w.avg : null;
+    b.dju = w ? w.dju : null;
+  });
   const done = bl.filter((b) => b.end != null);
   const durs = done.map((b) => b.end - b.start);
   const avg = mean(durs);
@@ -239,6 +244,25 @@ function computeStats() {
     endDate = now + remaining;
   }
 
+  // Prévision selon la météo : consommation par degré-jour (10 derniers sacs) × degrés-jours attendus
+  const doneW = done.filter((b) => b.dju != null).slice(-10);
+  const sumDju = doneW.reduce((s, b) => s + b.dju, 0);
+  const kgPerDju = doneW.length >= 3 && sumDju >= 8 ? (doneW.length * bagKg()) / sumDju : null;
+  let endMode = byPlanning ? 'planning' : 'simple';
+  if (kgPerDju && cur && WX.clim) {
+    const curKg = Math.min(bagKg(), (cur.dju || 0) * kgPerDju);
+    let kg = Math.max(0, stock) * bagKg() + (bagKg() - curKg);
+    const d0 = new Date(now);
+    d0.setHours(0, 0, 0, 0);
+    for (let i = 1; i <= 1800 && kg > 0; i++) {
+      const day = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() + i, 12);
+      const tc = climT(day.getTime());
+      if (tc == null) continue;
+      kg -= kgPerDju * Math.max(0, DJU_BASE - tc);
+      if (kg <= 0) { endDate = day.getTime(); remaining = endDate - now; endMode = 'meteo'; }
+    }
+  }
+
   const prices = bl.map((b) => bagPrice(b.ev)).filter((p) => p != null);
   const totalCost = prices.length ? prices.reduce((a, b) => a + b, 0) : null;
   const avgPrice = prices.length ? totalCost / prices.length : null;
@@ -248,7 +272,7 @@ function computeStats() {
 
   return {
     now, bl, done, durs, avg, avgRecent, stock, cur, remaining, endDate,
-    avgH, curH, weeklyH, byPlanning,
+    avgH, curH, weeklyH, byPlanning, endMode, kgPerDju,
     kgPerH: avgH ? bagKg() / (avgH / HOUR) : null,
     min: durs.length ? Math.min(...durs) : null,
     max: durs.length ? Math.max(...durs) : null,
@@ -277,6 +301,178 @@ async function fetchTempExt() {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* ----------------- Historique météo (Open-Meteo, gratuit, sans clé) -----------------
+   WX.h    : températures horaires { 'YYYY-MM-DDTHH': °C } (heure locale)
+   WX.clim : température moyenne par jour de l'année (2 dernières années), pour la prévision
+   DJU     : degrés-jours de chauffe, base 18 °C = Σ max(0, 18 − T) / 24 par heure                */
+let WX = (() => {
+  try {
+    const x = JSON.parse(localStorage.getItem('pellets.wx'));
+    if (x && x.h) return x;
+  } catch (e) { /* ignore */ }
+  return { h: {}, recentAt: 0, clim: null };
+})();
+let wxBusy = false;
+let climBusy = false;
+let wxTriedAt = 0;
+const DJU_BASE = 18;
+const p2 = (n) => String(n).padStart(2, '0');
+const hourKey = (ts) => {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}`;
+};
+const floorHour = (ts) => { const d = new Date(ts); d.setMinutes(0, 0, 0); return d.getTime(); };
+const CAL = (() => {
+  const a = [];
+  for (let d = new Date(2001, 0, 1); d.getFullYear() === 2001; d.setDate(d.getDate() + 1)) a.push(`${p2(d.getMonth() + 1)}-${p2(d.getDate())}`);
+  return a;
+})();
+
+function saveWx() {
+  try { localStorage.setItem('pellets.wx', JSON.stringify(WX)); } catch (e) { /* ignore */ }
+}
+
+function fetchJson(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  return fetch(url, { signal: ctl.signal })
+    .then((r) => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .finally(() => clearTimeout(timer));
+}
+
+// Moyenne de température et DJU sur [a, b] (pondérés par le temps passé dans chaque heure)
+function wxStats(a, b) {
+  if (!(b > a)) return null;
+  let sumT = 0;
+  let sumW = 0;
+  let dju = 0;
+  for (let h = floorHour(a); h < b; h += HOUR) {
+    const w = Math.min(b, h + HOUR) - Math.max(a, h);
+    if (w <= 0) continue;
+    const t = WX.h[hourKey(h)];
+    if (t == null) continue;
+    sumT += t * w;
+    sumW += w;
+    dju += (Math.max(0, DJU_BASE - t) * w) / DAY;
+  }
+  const cov = sumW / (b - a);
+  if (cov < 0.8) return null;
+  return { avg: sumT / sumW, dju: dju / cov, cov };
+}
+
+function ensureWeather() {
+  ensureWeatherHistory();
+  ensureClimate();
+}
+
+function ensureWeatherHistory(force) {
+  if (!S || wxBusy) return;
+  const o = opens();
+  if (!o.length) return;
+  const now = Date.now();
+  if (!force && now - wxTriedAt < 10 * 60000) return;
+
+  const start = floorHour(o[0].ts);
+  const last = floorHour(now) - HOUR;
+  const today0 = new Date(now);
+  today0.setHours(0, 0, 0, 0);
+  const cut = today0.getTime() - 9 * DAY; // avant : archive ; après : prévisions « passées »
+  let missOld = false;
+  let missNew = false;
+  for (let h = start; h <= last; h += HOUR) {
+    if (WX.h[hourKey(h)] == null) {
+      if (h < cut) missOld = true; else missNew = true;
+      if (missOld && missNew) break;
+    }
+  }
+  const stale = now - (WX.recentAt || 0) > 2 * HOUR;
+  if (!missOld && !missNew && !stale) return;
+
+  wxBusy = true;
+  wxTriedAt = now;
+  const base = `latitude=${S.settings.lat}&longitude=${S.settings.lon}&hourly=temperature_2m&timezone=Europe%2FParis`;
+  const jobs = [];
+  if (missOld) jobs.push(fetchJson(`https://archive-api.open-meteo.com/v1/archive?${base}&start_date=${ymd(start)}&end_date=${ymd(cut - DAY)}`));
+  jobs.push(fetchJson(`https://api.open-meteo.com/v1/forecast?${base}&past_days=10&forecast_days=1`));
+
+  Promise.all(jobs)
+    .then((res) => {
+      const nowKey = hourKey(Date.now());
+      for (const j of res) {
+        const t = j && j.hourly && j.hourly.time;
+        const v = j && j.hourly && j.hourly.temperature_2m;
+        if (!t || !v) continue;
+        for (let i = 0; i < t.length; i++) {
+          const k = String(t[i]).slice(0, 13);
+          if (v[i] != null && k <= nowKey) WX.h[k] = v[i];
+        }
+      }
+      WX.recentAt = Date.now();
+      saveWx();
+    })
+    .catch(() => { /* hors ligne : on réessaiera */ })
+    .finally(() => {
+      wxBusy = false;
+      if (S && ['home', 'history', 'stats'].includes(tab) && !$('.sheet-wrap')) render();
+    });
+}
+
+function buildClim(j) {
+  const t = j && j.daily && j.daily.time;
+  const v = j && j.daily && j.daily.temperature_2m_mean;
+  if (!t || !v) return null;
+  const sum = {};
+  const cnt = {};
+  t.forEach((d, i) => {
+    if (v[i] == null) return;
+    const k = String(d).slice(5);
+    sum[k] = (sum[k] || 0) + v[i];
+    cnt[k] = (cnt[k] || 0) + 1;
+  });
+  const raw = CAL.map((k) => (cnt[k] ? sum[k] / cnt[k] : null));
+  const n = CAL.length;
+  const out = {};
+  let ok = 0;
+  CAL.forEach((k, i) => {
+    let s = 0;
+    let c = 0;
+    for (let o = -3; o <= 3; o++) {
+      const x = raw[(i + o + n) % n];
+      if (x != null) { s += x; c++; }
+    }
+    if (c) { out[k] = round(s / c, 2); ok++; }
+  });
+  return ok > 300 ? out : null;
+}
+
+function ensureClimate() {
+  if (!S || climBusy) return;
+  if (WX.clim && Date.now() - WX.clim.at < 30 * DAY) return;
+  climBusy = true;
+  const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${S.settings.lat}&longitude=${S.settings.lon}`
+    + `&start_date=${ymd(Date.now() - 730 * DAY)}&end_date=${ymd(Date.now() - 8 * DAY)}&daily=temperature_2m_mean&timezone=Europe%2FParis`;
+  fetchJson(url)
+    .then((j) => {
+      const d = buildClim(j);
+      if (d) { WX.clim = { at: Date.now(), d }; saveWx(); }
+    })
+    .catch(() => { /* ignore */ })
+    .finally(() => {
+      climBusy = false;
+      if (S && tab === 'stats' && !$('.sheet-wrap')) render();
+    });
+}
+
+// Température « normale » d'un jour (moyenne des 2 dernières années à la même date)
+function climT(ts) {
+  const d = WX.clim && WX.clim.d;
+  if (!d) return null;
+  const dt = new Date(ts);
+  let k = `${p2(dt.getMonth() + 1)}-${p2(dt.getDate())}`;
+  if (k === '02-29') k = '02-28';
+  return d[k] != null ? d[k] : null;
 }
 
 // Température extérieure « en direct » affichée sur l'accueil (cache 15 min)
@@ -476,7 +672,8 @@ function renderHistory() {
         sub = `En cours · ${fmtDur(st.now - b.start)} · ${fmtH(stoveMs(b.start, st.now))} de chauffe`;
       }
       const price = bagPrice(e);
-      const temps = [e.tempExt != null ? `ext ${fmtTemp(e.tempExt)}` : '', e.tempInt != null ? `int ${fmtTemp(e.tempInt)}` : ''].filter(Boolean).join(' · ');
+      const tm = b.t != null ? `moy. dehors ${fmtTemp(b.t)}` : (e.tempExt != null ? `ext ${fmtTemp(e.tempExt)}` : '');
+      const temps = [tm, e.tempInt != null ? `int ${fmtTemp(e.tempInt)}` : ''].filter(Boolean).join(' · ');
       return `<button class="item" data-edit="${e.id}">
         <div class="badge">n°${b.n}</div>
         <div class="main"><div class="t1">${esc(fmtDT(e.ts))}</div><div class="t2">${sub}${cmp}${e.brand ? ' · ' + esc(e.brand) : ''}</div></div>
@@ -615,6 +812,32 @@ function periodItems(st) {
   return out;
 }
 
+// Section « Météo par sac » de la page Stats
+function meteoSection(st, card) {
+  const tDone = st.done.filter((b) => b.t != null).map((b) => b.t);
+  const tAvg = mean(tDone);
+  const rows = st.bl.slice(-10).reverse().map((b) => {
+    const fin = b.end != null;
+    const kgd = fin && b.dju != null && b.dju > 0.5 ? bagKg() / b.dju : null;
+    return `<tr><td>n°${b.n}${fin ? '' : ' (en cours)'}</td><td>${b.t != null ? fmtNum(b.t, 1) + ' °C' : '…'}</td><td>${b.dju != null ? fmtNum(b.dju, 1) : '…'}</td><td>${kgd != null ? fmtNum(kgd, 2) : '—'}</td></tr>`;
+  }).join('');
+  const loading = st.bl.some((b) => b.t == null);
+  return `
+    <h3>Météo par sac</h3>
+    <div class="grid2">
+      ${card('Dehors en moyenne', tAvg != null ? `${fmtNum(tAvg, 1)} <small>°C</small>` : '—', 'pendant les sacs terminés')}
+      ${card('Par degré-jour', st.kgPerDju ? `${fmtNum(st.kgPerDju, 2)} <small>kg/DJU</small>` : '—', st.kgPerDju ? 'base 18 °C, 10 derniers sacs' : 'dès 3 sacs terminés')}
+    </div>
+    <div class="card" style="margin-top:12px">
+      <table class="tbl">
+        <thead><tr><th>Sac</th><th>Dehors</th><th>DJU</th><th>kg/DJU</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${loading ? '<p class="hint" style="margin:10px 0 0">Météo en cours de chargement (connexion nécessaire)…</p>' : ''}
+      <p class="hint" style="margin:10px 0 0">DJU = degrés-jours : plus il fait froid longtemps, plus il y en a. Les kg/DJU permettent de comparer des sacs malgré la météo : plus c'est bas, mieux le poêle se comporte.</p>
+    </div>`;
+}
+
 function renderStats() {
   const st = computeStats();
   if (!st.bl.length) return `<h1>Stats</h1><p class="muted">Pas encore de données.</p>`;
@@ -655,9 +878,10 @@ function renderStats() {
     <div class="card" style="margin-top:12px">
       <div class="kpi-label">Fin du stock estimée</div>
       <div class="kpi">${st.endDate ? esc(fmtDate(st.endDate, true)) : '—'}</div>
-      <div class="kpi-sub">${st.endDate ? `dans ≈ ${Math.round(st.remaining / DAY)} jours, avec ${Math.max(0, st.stock)} sacs en réserve + le sac en cours${st.byPlanning ? ', selon ton planning de chauffe' : ''}` : 'Disponible dès que 2 sacs ont été utilisés.'}</div>
+      <div class="kpi-sub">${st.endDate ? `dans ≈ ${Math.round(st.remaining / DAY)} jours, avec ${Math.max(0, st.stock)} sacs en réserve + le sac en cours${st.endMode === 'meteo' ? ', selon la météo des deux dernières années' : st.endMode === 'planning' ? ', selon ton planning de chauffe' : ''}` : 'Disponible dès que 2 sacs ont été utilisés.'}</div>
     </div>
     ${costHtml}
+    ${meteoSection(st, card)}
     <h3>Durée de chaque sac (${uLabel})</h3>
     <div class="card">${svgBars(durItems, { avg: st.avg != null ? st.avg / div : null, fmt: dFmt, label: 'Durée de chaque sac' })}${st.done.length > 20 ? '<p class="small muted" style="margin:6px 0 0">20 derniers sacs terminés</p>' : ''}</div>
     <h3>Évolution du stock</h3>
@@ -863,6 +1087,7 @@ const forms = {
     applyTheme();
     render();
     refreshWeather(true);
+    ensureWeather();
     if (Math.abs(Date.now() - ts) < 6 * HOUR) attachExtTemp(ev.id);
     toast('C\'est parti ! Appuie sur « Nouveau sac » à chaque sac ouvert.');
   },
@@ -870,6 +1095,7 @@ const forms = {
   settings(f) {
     const d = new FormData(f);
     const s = S.settings;
+    const oldLoc = `${s.lat},${s.lon}`;
     s.palettePrice = num(d.get('palettePrice'));
     s.bagsPerPalette = num(d.get('bpp'));
     s.brand = String(d.get('brand') || '').trim();
@@ -877,6 +1103,14 @@ const forms = {
     s.bagKg = num(d.get('bagKg')) || 15;
     s.lat = num(d.get('lat')) ?? s.lat;
     s.lon = num(d.get('lon')) ?? s.lon;
+    if (oldLoc !== `${s.lat},${s.lon}`) {
+      WX = { h: {}, recentAt: 0, clim: null };
+      saveWx();
+      wxTriedAt = 0;
+      weather = null;
+      ensureWeather();
+      refreshWeather(true);
+    }
     save();
     applyTheme();
     render();
@@ -974,15 +1208,15 @@ const dec = (v) => (v == null ? '' : String(v).replace('.', ','));
 const ymdhm = (ts) => toLocalInput(ts).replace('T', ' ');
 
 function exportCSV() {
-  const head = ['type', 'numero_sac', 'debut', 'fin', 'duree_heures', 'heures_chauffe', 'prix_sac_eur', 'marque', 'temp_ext_c', 'temp_int_c', 'nb_sacs', 'montant_livraison_eur', 'note'];
-  const map = new Map(bags().map((b) => [b.ev.id, b]));
+  const head = ['type', 'numero_sac', 'debut', 'fin', 'duree_heures', 'heures_chauffe', 'temp_ext_moy_c', 'dju18', 'prix_sac_eur', 'marque', 'temp_ext_c', 'temp_int_c', 'nb_sacs', 'montant_livraison_eur', 'note'];
+  const map = new Map(computeStats().bl.map((b) => [b.ev.id, b]));
   const rows = [...S.events].sort((a, b) => a.ts - b.ts).map((e) => {
     if (e.type === 'open') {
       const b = map.get(e.id);
-      return ['sac', b.n, ymdhm(e.ts), b.end ? ymdhm(b.end) : '', b.end ? dec(round((b.end - b.start) / HOUR, 2)) : '', dec(round(stoveMs(b.start, b.end || Date.now()) / HOUR, 2)), dec(bagPrice(e)), e.brand || '', dec(e.tempExt), dec(e.tempInt), '', '', e.note || ''];
+      return ['sac', b.n, ymdhm(e.ts), b.end ? ymdhm(b.end) : '', b.end ? dec(round((b.end - b.start) / HOUR, 2)) : '', dec(round(stoveMs(b.start, b.end || Date.now()) / HOUR, 2)), dec(round(b.t, 1)), dec(round(b.dju, 1)), dec(bagPrice(e)), e.brand || '', dec(e.tempExt), dec(e.tempInt), '', '', e.note || ''];
     }
-    if (e.type === 'delivery') return ['livraison', '', ymdhm(e.ts), '', '', '', '', '', '', '', e.bags, dec(e.total), e.note || ''];
-    return ['ajustement', '', ymdhm(e.ts), '', '', '', '', '', '', '', e.delta, '', e.note || ''];
+    if (e.type === 'delivery') return ['livraison', '', ymdhm(e.ts), '', '', '', '', '', '', '', '', '', e.bags, dec(e.total), e.note || ''];
+    return ['ajustement', '', ymdhm(e.ts), '', '', '', '', '', '', '', '', '', e.delta, '', e.note || ''];
   });
   const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\r\n');
   download(`pellets-${ymd(Date.now())}.csv`, csv, 'text/csv;charset=utf-8');
@@ -1038,7 +1272,7 @@ document.addEventListener('click', (e) => {
     if (a) a.fn();
     return;
   }
-  if (el.dataset.tab) { tab = el.dataset.tab; render(); window.scrollTo(0, 0); if (tab === 'home') refreshWeather(); return; }
+  if (el.dataset.tab) { tab = el.dataset.tab; render(); window.scrollTo(0, 0); if (tab === 'home') refreshWeather(); ensureWeather(); return; }
   if (el.dataset.period) { period = el.dataset.period; render(); return; }
   if (el.dataset.edit) { editSheet(el.dataset.edit); return; }
 
@@ -1073,6 +1307,8 @@ document.addEventListener('click', (e) => {
     case 'reset':
       if (confirm('Effacer TOUTES les données de ce téléphone ?') && confirm('Dernière confirmation : cette action est définitive.')) {
         localStorage.removeItem(KEY);
+        localStorage.removeItem('pellets.wx');
+        WX = { h: {}, recentAt: 0, clim: null };
         S = null;
         tab = 'home';
         render();
@@ -1100,7 +1336,7 @@ function tick() {
 setInterval(tick, 30000);
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && S && !$('.sheet-wrap')) { render(); refreshWeather(); }
+  if (!document.hidden && S && !$('.sheet-wrap')) { render(); refreshWeather(); ensureWeather(); }
 });
 
 window.addEventListener('beforeinstallprompt', (e) => {
@@ -1117,3 +1353,4 @@ if (navigator.storage && navigator.storage.persist) navigator.storage.persist().
 applyTheme();
 render();
 refreshWeather();
+ensureWeather();
